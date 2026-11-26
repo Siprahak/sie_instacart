@@ -12,6 +12,14 @@ export const pool = mysql.createPool({
   database: process.env.DB_NAME ?? "sie_instacart",
   decimalNumbers: true,
   connectionLimit: 4,
+  connectTimeout: 20000,
+  ssl:
+    process.env.DB_HOST && process.env.DB_HOST !== "localhost"
+      ? {
+          minVersion: "TLSv1.2",
+          rejectUnauthorized: true,
+        }
+      : undefined,
 });
 
 async function q<T>(sql: string): Promise<T[]> {
