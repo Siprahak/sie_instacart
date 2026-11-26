@@ -36,33 +36,51 @@ export function clearDashboardCache() {
 export async function getDashboardData(): Promise<Data> {
   if (cache) return cache;
 
-  const [k] = await q<Record<string, number>>(`
-    SELECT (SELECT COUNT(*) FROM orders) AS total_orders,
-           (SELECT COUNT(DISTINCT user_id) FROM orders) AS total_users,
-           (SELECT COUNT(*) FROM order_items) AS total_items,
-           (SELECT AVG(reordered) FROM order_items) AS reorder_rate,
-           (SELECT AVG(days_since_prior_order) FROM orders) AS avg_days,
-           (SELECT COUNT(DISTINCT product_id) FROM order_items) AS total_products,
-           (SELECT COUNT(DISTINCT user_id) FROM orders WHERE is_first_order = 0) AS repeat_users,
-           (SELECT SUM(CASE WHEN order_dow IN (0, 6) THEN 1 ELSE 0 END) FROM orders) AS weekend_orders,
-           (SELECT SUM(CASE WHEN is_first_order = 1 THEN 1 ELSE 0 END) FROM orders) AS first_time_orders
-  `);
-
-  const by_dow = (
-    await q<{ order_dow: number; orders: number; items: number; reordered_items: number }>(`
+  const [
+    [ordStats],
+    [itemStats],
+    by_dow_raw,
+    by_hour,
+    heatmap_dow_hour,
+    products_raw,
+    days_prior_dist,
+    top_first_cart,
+  ] = await Promise.all([
+    q<Record<string, number>>(`
+      SELECT COUNT(*) AS total_orders,
+             COUNT(DISTINCT user_id) AS total_users,
+             AVG(days_since_prior_order) AS avg_days,
+             COUNT(DISTINCT CASE WHEN is_first_order = 0 THEN user_id END) AS repeat_users,
+             SUM(CASE WHEN order_dow IN (0, 6) THEN 1 ELSE 0 END) AS weekend_orders,
+             SUM(CASE WHEN is_first_order = 1 THEN 1 ELSE 0 END) AS first_time_orders
+      FROM orders
+    `),
+    q<Record<string, number>>(`
+      SELECT COUNT(*) AS total_items,
+             AVG(reordered) AS reorder_rate,
+             COUNT(DISTINCT product_id) AS total_products
+      FROM order_items
+    `),
+    q<{ order_dow: number; orders: number; items: number; reordered_items: number }>(`
       SELECT o.order_dow, COUNT(DISTINCT o.order_id) AS orders, COUNT(*) AS items, SUM(oi.reordered) AS reordered_items
-      FROM order_items oi JOIN orders o USING (order_id) GROUP BY o.order_dow ORDER BY o.order_dow`)
-  ).map((r) => ({ ...r, order_dow_name: DOW[r.order_dow] }));
-
-  const by_hour = await q<{ order_hour_of_day: number; orders: number; items: number; reordered_items: number }>(`
-    SELECT o.order_hour_of_day, COUNT(DISTINCT o.order_id) AS orders, COUNT(*) AS items, SUM(oi.reordered) AS reordered_items
-    FROM order_items oi JOIN orders o USING (order_id) GROUP BY o.order_hour_of_day ORDER BY o.order_hour_of_day`);
-
-  const heatmap_dow_hour = await q<{ order_dow: number; order_hour_of_day: number; orders: number }>(`
-    SELECT order_dow, order_hour_of_day, COUNT(*) AS orders FROM orders GROUP BY order_dow, order_hour_of_day`);
-
-  const products = (
-    await q<{
+      FROM order_items oi
+      JOIN orders o ON o.order_id = oi.order_id
+      GROUP BY o.order_dow
+      ORDER BY o.order_dow
+    `),
+    q<{ order_hour_of_day: number; orders: number; items: number; reordered_items: number }>(`
+      SELECT o.order_hour_of_day, COUNT(DISTINCT o.order_id) AS orders, COUNT(*) AS items, SUM(oi.reordered) AS reordered_items
+      FROM order_items oi
+      JOIN orders o ON o.order_id = oi.order_id
+      GROUP BY o.order_hour_of_day
+      ORDER BY o.order_hour_of_day
+    `),
+    q<{ order_dow: number; order_hour_of_day: number; orders: number }>(`
+      SELECT order_dow, order_hour_of_day, COUNT(*) AS orders
+      FROM orders
+      GROUP BY order_dow, order_hour_of_day
+    `),
+    q<{
       product_id: number;
       product_name: string;
       aisle: string;
@@ -73,30 +91,40 @@ export async function getDashboardData(): Promise<Data> {
     }>(`
       SELECT p.product_id, p.product_name, a.aisle, d.department_label,
              COUNT(*) AS orders, COUNT(*) AS items, SUM(oi.reordered) AS reordered_items
-      FROM order_items oi JOIN products p USING (product_id)
-      JOIN aisles a ON a.aisle_id = p.aisle_id JOIN departments d ON d.department_id = a.department_id
-      GROUP BY p.product_id, p.product_name, a.aisle, d.department_label`)
-  ).map((r) => ({ ...r, reorder_rate: round(r.reordered_items / r.items) }));
+      FROM order_items oi
+      JOIN products p ON p.product_id = oi.product_id
+      JOIN aisles a ON a.aisle_id = p.aisle_id
+      JOIN departments d ON d.department_id = a.department_id
+      GROUP BY p.product_id, p.product_name, a.aisle, d.department_label
+    `),
+    q<{ days: number; orders: number }>(`
+      SELECT days_since_prior_order AS days, COUNT(*) AS orders
+      FROM orders
+      WHERE days_since_prior_order IS NOT NULL
+      GROUP BY days_since_prior_order
+      ORDER BY days_since_prior_order ASC
+    `),
+    q<{
+      product_id: number;
+      product_name: string;
+      department_label: string;
+      first_cart_count: number;
+    }>(`
+      SELECT p.product_id, p.product_name, d.department_label, COUNT(*) AS first_cart_count
+      FROM order_items oi
+      JOIN products p ON p.product_id = oi.product_id
+      JOIN aisles a ON a.aisle_id = p.aisle_id
+      JOIN departments d ON d.department_id = a.department_id
+      WHERE oi.add_to_cart_order = 1
+      GROUP BY p.product_id, p.product_name, d.department_label
+      ORDER BY first_cart_count DESC
+      LIMIT 15
+    `),
+  ]);
 
-  const days_prior_dist = await q<{ days: number; orders: number }>(`
-    SELECT days_since_prior_order AS days, COUNT(*) AS orders
-    FROM orders WHERE days_since_prior_order IS NOT NULL
-    GROUP BY days_since_prior_order ORDER BY days_since_prior_order ASC`);
-
-  const top_first_cart = await q<{
-    product_id: number;
-    product_name: string;
-    department_label: string;
-    first_cart_count: number;
-  }>(`
-    SELECT p.product_id, p.product_name, d.department_label, COUNT(*) AS first_cart_count
-    FROM order_items oi
-    JOIN products p USING (product_id)
-    JOIN aisles a ON a.aisle_id = p.aisle_id
-    JOIN departments d ON d.department_id = a.department_id
-    WHERE oi.add_to_cart_order = 1
-    GROUP BY p.product_id, p.product_name, d.department_label
-    ORDER BY first_cart_count DESC LIMIT 15`);
+  const k = { ...ordStats, ...itemStats };
+  const by_dow = by_dow_raw.map((r) => ({ ...r, order_dow_name: DOW[r.order_dow] }));
+  const products = products_raw.map((r) => ({ ...r, reorder_rate: round(r.reordered_items / r.items) }));
 
   const roll = (keys: string[]) => {
     const m = new Map<string, Record<string, any>>();
