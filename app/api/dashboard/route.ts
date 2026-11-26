@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
 import { getDashboardData } from "@/lib/db";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
 export async function GET() {
   try {
-    return NextResponse.json(await getDashboardData());
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 500 });
+    const data = await getDashboardData();
+    return NextResponse.json(data);
+  } catch (err: any) {
+    console.error("Dashboard Error:", err);
+    return NextResponse.json(
+      { error: err?.message || "Gagal mengambil data dashboard" },
+      { status: 500 }
+    );
   }
 }
